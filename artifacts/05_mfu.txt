@@ -1,0 +1,80 @@
+device : Intel(R) Xeon(R) Processor @ 2.10GHz
+         4 physical cores @ 2.1 GHz, AVX-512 (16 fp32 lanes x 2 FLOPs/FMA x 2 ports = 64 FLOPs/cycle/core)
+         AMX present: True, AVX-512 bf16: True   (neither is reachable from fp32 eager PyTorch)
+
+theoretical fp32 peak     :    537.6 GFLOP/s
+measured SGEMM 1024x1024    :    188.1 GFLOP/s
+measured SGEMM 2048x2048    :    472.7 GFLOP/s
+practical ceiling (best)  :    472.7 GFLOP/s = 87.9% of theoretical
+
+model FLOPs accounting (B=16, T=128):
+  matmul parameters        : 794,752
+  fwd weight FLOPs/token   : 1,589,504
+  fwd attention FLOPs/token: 262,144  (14.2% of forward)
+  total FLOPs/token (f+b)  : 5,554,944
+  FLOPs per step           : 11.3765 GFLOP
+
+measured step time        : 75.93 ms  (26,973 tokens/s)
+achieved                  :   149.84 GFLOP/s
+
+  MFU vs theoretical peak    : 27.87%
+  MFU vs measured SGEMM peak : 31.70%
+
+where the step time actually goes:
+  data         0.43 ms    0.6%
+  forward     25.41 ms   33.5%
+  backward    41.12 ms   54.2%
+  gradnorm     2.53 ms    3.3%
+  clip         1.52 ms    2.0%
+  opt          4.73 ms    6.2%
+  unaccounted    0.19 ms    0.3%
+
+MATMUL SHAPE CENSUS
+matmul                              M     K     N  x   GFLOP/s  % of peak  FLOP share
+------------------------------------------------------------------------------------------
+c_attn   (B*T,C)x(C,3C)          2048   128   384  4     523.7    110.8%      21.2%
+attn QK^T per head               8192    32   128  4     446.0     94.3%       7.1%
+attn AV   per head               8192   128    32  4     452.7     95.8%       7.1%
+attn c_proj (B*T,C)x(C,C)        2048   128   128  4     497.8    105.3%       7.1%
+mlp c_fc  (B*T,C)x(C,4C)         2048   128   512  4     500.1    105.8%      28.3%
+mlp c_proj (B*T,4C)x(4C,C)       2048   512   128  4     301.1     63.7%      28.3%
+lm_head  (B*T,C)x(C,V)           2048   128    65  1     336.1     71.1%       0.9%
+
+FLOP-weighted matmul throughput: 417.3 GFLOP/s = 88.3% of peak
+  (so matmul SHAPE is not the problem here)
+
+OPERATOR ATTRIBUTION
+matmul ops (mm/addmm/bmm) : 49.6% of step time
+everything else          : 50.4% of step time
+
+(call counts are TOTALS over the 5 profiled steps, not per-step)
+
+operator                              self %    calls
+------------------------------------------------------
+aten::mm                              27.8%      175  <- matmul
+aten::addmm                           11.6%       80  <- matmul
+aten::bmm                             10.1%      120  <- matmul
+aten::copy_                            9.7%     1605
+aten::gelu_backward                    3.4%       20
+aten::masked_fill_                     3.1%       40
+Optimizer.step#AdamW.step              2.4%        5
+aten::mul                              2.3%       40
+aten::sum                              2.3%       90
+aten::native_layer_norm_backward       2.0%       45
+aten::_softmax                         1.8%       20
+aten::gelu                             1.7%       20
+aten::add_                             1.4%      560
+aten::cat                              1.3%       20
+aten::_softmax_backward_data           1.3%       20
+aten::mul_                             1.3%      520
+aten::native_layer_norm                1.0%       45
+aten::add                              0.9%       50
+
+MFU vs MODEL SIZE
+n_embd layers   B    T      params  ms/step  GFLOP/s     MFU
+---------------------------------------------------------------
+   128      4  16  128     818,048     67.0    169.9   33.5%
+   192      4  16  128   1,816,896    142.5    170.6   33.8%
+   256      4  16  128   3,208,960    167.5    251.2   50.7%
+   384      4  16  128   7,172,736    339.0    271.7   53.0%
+   512      4  16  128  12,709,376    565.6    285.5   58.6%

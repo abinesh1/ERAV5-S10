@@ -1,0 +1,35 @@
+micro-batches: 4, sequences each: 8, total real tokens: 2227
+
+micro   tokens  share of batch   token weight vs correct
+-----  -------  --------------  ------------------------
+    0      283          12.7%                    1.967x
+    1      401          18.0%                    1.388x
+    2      714          32.1%                    0.780x
+    3      829          37.2%                    0.672x
+
+  longest/shortest micro-batch token ratio : 2.93x
+  over/under-weighting spread              : 2.93x
+
+reported loss, correct       : 4.189254
+reported loss, mean-of-means : 4.193554   (delta +0.004300)
+
+gradient comparison at identical weights:
+  cosine similarity  : 0.996735   (1.0 would mean same direction)
+  angle between them : 4.631 degrees
+  relative L2 error  : 8.1128%
+  norm ratio         : 1.0047   (Adam largely absorbs THIS part)
+
+CONTROL - all micro-batches exactly 512 tokens:
+  cosine similarity      : 1.0000000000
+  max |elementwise diff| : 0.000e+00  (0.0 = bit-for-bit identical)
+  => identical, as the algebra requires. The bug needs unequal lengths.
+
+
+TRAINING BOTH REDUCTIONS
+step    0 | val(correct) 4.0690 | val(mean-of-means) 4.0724 | gap +0.0034
+step   50 | val(correct) 2.5579 | val(mean-of-means) 2.5706 | gap +0.0128
+step  100 | val(correct) 2.4922 | val(mean-of-means) 2.5130 | gap +0.0207
+step  150 | val(correct) 2.4423 | val(mean-of-means) 2.4605 | gap +0.0181
+step  200 | val(correct) 2.3846 | val(mean-of-means) 2.4091 | gap +0.0245
+step  250 | val(correct) 2.3323 | val(mean-of-means) 2.3651 | gap +0.0328
+step  299 | val(correct) 2.2956 | val(mean-of-means) 2.3285 | gap +0.0329

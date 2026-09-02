@@ -1,0 +1,34 @@
+weight under test : blocks.0.mlp.c_fc.weight[214, 46]   (shape (256, 64), torch.float64)
+  w                          = -0.00331202941015363
+  h (nudge)                  = 1.0e-06
+  L(w)                       = 4.19472072983938382
+  L(w+h)                     = 4.19472074704349662
+  L(w-h)                     = 4.19472071263527546
+  L(w+h) - L(w-h)            = +3.441e-08
+
+  numeric  [L(w+h)-L(w-h)]/2h = +0.01720411058059312
+  analytic backward() says    = +0.01720411042204470
+  absolute difference         = 1.585e-10
+  relative difference         = 9.216e-09
+  => they agree to 8.0 decimal digits
+
+  (forward difference only, for contrast: +0.017204112801, rel err 1.383e-07)
+
+
+STEP-SIZE SWEEP
+         h                 numeric    rel error  digits  regime
+----------  ----------------------  -----------  ------  --------------------------
+     1e-01      +0.017062559245065     8.23e-03     2.1  truncation error dominates
+     1e-02      +0.017202673155170     8.35e-05     4.1  truncation error dominates
+     1e-03      +0.017204096048218     8.35e-07     6.1  truncation error dominates
+     1e-04      +0.017204110283053     8.08e-09     8.1  truncation error dominates
+     1e-05      +0.017204110447366     1.47e-09     8.8  <-- best
+     1e-06      +0.017204110580593     9.22e-09     8.0  round-off error dominates
+     1e-07      +0.017204109248325     6.82e-08     7.2  round-off error dominates
+     1e-08      +0.017204149216354     2.25e-06     5.6  round-off error dominates
+     1e-09      +0.017204015989591     5.49e-06     5.3  round-off error dominates
+     1e-10      +0.017208456881690     2.53e-04     3.6  round-off error dominates
+     1e-11      +0.017230661342182     1.54e-03     2.8  round-off error dominates
+     1e-12      +0.016875389974302     1.91e-02     1.7  round-off error dominates
+
+torch.autograd.gradcheck over all 16 parameter tensors: True

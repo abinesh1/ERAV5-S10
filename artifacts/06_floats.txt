@@ -1,0 +1,48 @@
+decimal 0.1 = exactly 1/10
+in binary: 0.0(0011) repeating  =  1.1001100110011... x 2^-4
+so in every format below: sign = 0, unbiased exponent = -4,
+and the mantissa is as many bits of 0.6 = .1001 1001 1001... as will fit.
+
+--- fp32  (32 bits: 1 sign + 8 exponent + 23 mantissa, bias 127) ---
+  IEEE 754 binary32
+  exponent field : -4 + 127 = 123 = 01111011
+  mantissa field : 10011001100110011001101   (rounded UP; discarded tail = 0.8000 of an ulp)
+  bit pattern    : 0 01111011 10011001100110011001101   = 0x3DCCCCCD
+  hardware says  : 0x3DCCCCCD   -> MATCH
+  value stored   : 13421773/134217728 = 0.10000000149011612
+  relative error : 1.490e-08   (0.0000%)
+
+--- bf16  (16 bits: 1 sign + 8 exponent + 7 mantissa, bias 127) ---
+  fp32 with 16 mantissa bits chopped off
+  exponent field : -4 + 127 = 123 = 01111011
+  mantissa field : 1001101   (rounded UP; discarded tail = 0.8000 of an ulp)
+  bit pattern    : 0 01111011 1001101   = 0x3DCD
+  hardware says  : 0x3DCD   -> MATCH
+  value stored   : 205/2048 = 0.10009765625
+  relative error : 9.766e-04   (0.0977%)
+
+--- fp8 E4M3  (8 bits: 1 sign + 4 exponent + 3 mantissa, bias 7) ---
+  OCP/NVIDIA e4m3fn: no inf, one NaN
+  exponent field : -4 + 7 = 3 = 0011
+  mantissa field : 101   (rounded UP; discarded tail = 0.8000 of an ulp)
+  bit pattern    : 0 0011 101   = 0x1D
+  hardware says  : 0x1D   -> MATCH
+  value stored   : 13/128 = 0.1015625
+  relative error : 1.562e-02   (1.5625%)
+
+
+PRECISION / RANGE
+format     bits  e  m  eps (2^-m) ~dec digits  min normal  max normal       range
+----------------------------------------------------------------------------------
+fp32         32  8 23   1.192e-07         7.9    1.18e-38    3.40e+38     76.5 dec
+bf16         16  8  7   7.812e-03         3.1    1.18e-38    3.39e+38     76.5 dec
+fp8 E4M3      8  4  3   1.250e-01         1.9    1.56e-02    4.48e+02      4.5 dec
+
+
+ACCUMULATION
+adding 0.1 to itself 1000 times (exact answer: 100.0):
+format               result   relative error
+----------------------------------------------
+fp32              99.999046          0.001%
+bf16              32.000000         68.000%
+fp8 E4M3           2.000000         98.000%

@@ -1,0 +1,168 @@
+ONE TRAINING STEP, EVERY TENSOR
+===============================
+
+B = 4   batch: independent sequences processed together
+T = 16   time/position: token slots within each sequence
+C = 128  channels: width of the residual stream (n_embd)
+H = 4   heads: attention heads per block
+D = 32  head width: C / H
+V = 65  vocab: distinct characters in the corpus
+L = 4   layers: transformer blocks
+
+
+PARAMETERS (learnable tensors)
+==============================
+
+blocks.1..3 are identical to blocks.0 and are omitted.
+
+parameter                    shape        count  meaning of each axis
+---------------------------  ----------  ------  --------------------------------------------------------
+wte.weight                   (65, 128)    8,320  V=65 rows (one embedding per token), C=128 channels. TIED to lm_head.weight
+wpe.weight                   (128, 128)  16,384  T=128 rows (one embedding per position), C=128 channels
+blocks.0.ln_1.weight         (128)          128  C=128 gain, pre-attention LayerNorm   [x4 blocks]
+blocks.0.ln_1.bias           (128)          128  C=128 shift, pre-attention LayerNorm   [x4 blocks]
+blocks.0.attn.c_attn.weight  (384, 128)  49,152  3C=384 out (q|k|v stacked), C=128 in - one matmul makes all three   [x4 blocks]
+blocks.0.attn.c_attn.bias    (384)          384  3C=384 biases, one per q/k/v channel   [x4 blocks]
+blocks.0.attn.c_proj.weight  (128, 128)  16,384  C=128 out, C=128 in - mixes the heads back together   [x4 blocks]
+blocks.0.attn.c_proj.bias    (128)          128  C=128 output biases   [x4 blocks]
+blocks.0.ln_2.weight         (128)          128  C=128 gain, pre-MLP LayerNorm   [x4 blocks]
+blocks.0.ln_2.bias           (128)          128  C=128 shift, pre-MLP LayerNorm   [x4 blocks]
+blocks.0.mlp.c_fc.weight     (512, 128)  65,536  4C=512 out, C=128 in - widen   [x4 blocks]
+blocks.0.mlp.c_fc.bias       (512)          512  4C=512 biases   [x4 blocks]
+blocks.0.mlp.c_proj.weight   (128, 512)  65,536  C=128 out, 4C=512 in - narrow back   [x4 blocks]
+blocks.0.mlp.c_proj.bias     (128)          128  C=128 biases   [x4 blocks]
+ln_f.weight                  (128)          128  C=128 per-channel gain of the final LayerNorm
+ln_f.bias                    (128)          128  C=128 per-channel shift of the final LayerNorm
+
+total parameters: 818,048
+  (wte.weight and lm_head.weight are the SAME tensor - counted once)
+
+
+Note on block0 vs block1..3: the tracer records every block, but blocks
+1-3 repeat block0's shapes exactly, so only block0 is shown above in the
+parameter and gradient tables. The forward table below lists all of them.
+
+
+FORWARD PASS (activations)
+==========================
+
+tensor                   shape           dtype    what the dimensions mean
+-----------------------  --------------  -------  --------------------------------------------------------
+input.idx                (4, 16)         int64    B=batch, T=positions; each entry is a token id in [0, vocab)
+embed.tok                (4, 16, 128)    float32  B=batch, T=positions, C=embedding width (what the token is)
+embed.pos                (16, 128)       float32  T=positions, C=embedding width (where the token is); broadcast over B
+embed.sum                (4, 16, 128)    float32  B=batch, T=positions, C=residual stream at layer 0
+block0.attn.qkv          (4, 16, 384)    float32  B=batch, T=positions, 3C=q|k|v packed side by side
+block0.attn.q            (4, 4, 16, 32)  float32  B=batch, H=heads, T=query positions, D=head width
+block0.attn.k            (4, 4, 16, 32)  float32  B=batch, H=heads, T=key positions, D=head width
+block0.attn.v            (4, 4, 16, 32)  float32  B=batch, H=heads, T=value positions, D=head width
+block0.attn.scores       (4, 4, 16, 16)  float32  B=batch, H=heads, T=query pos, T=key pos (row i = what token i attends to)
+block0.attn.out_heads    (4, 16, 128)    float32  B=batch, T=positions, C=heads re-merged back into the residual width
+block0.block.after_attn  (4, 16, 128)    float32  B=batch, T=positions, C=residual stream after the attention add
+block0.mlp.hidden        (4, 16, 512)    float32  B=batch, T=positions, 4C=widened feature space (per position, independent)
+block0.mlp.out           (4, 16, 128)    float32  B=batch, T=positions, C=projected back to residual width
+block0.block.after_mlp   (4, 16, 128)    float32  B=batch, T=positions, C=residual stream after the MLP add
+block1.attn.qkv          (4, 16, 384)    float32  B=batch, T=positions, 3C=q|k|v packed side by side
+block1.attn.q            (4, 4, 16, 32)  float32  B=batch, H=heads, T=query positions, D=head width
+block1.attn.k            (4, 4, 16, 32)  float32  B=batch, H=heads, T=key positions, D=head width
+block1.attn.v            (4, 4, 16, 32)  float32  B=batch, H=heads, T=value positions, D=head width
+block1.attn.scores       (4, 4, 16, 16)  float32  B=batch, H=heads, T=query pos, T=key pos (row i = what token i attends to)
+block1.attn.out_heads    (4, 16, 128)    float32  B=batch, T=positions, C=heads re-merged back into the residual width
+block1.block.after_attn  (4, 16, 128)    float32  B=batch, T=positions, C=residual stream after the attention add
+block1.mlp.hidden        (4, 16, 512)    float32  B=batch, T=positions, 4C=widened feature space (per position, independent)
+block1.mlp.out           (4, 16, 128)    float32  B=batch, T=positions, C=projected back to residual width
+block1.block.after_mlp   (4, 16, 128)    float32  B=batch, T=positions, C=residual stream after the MLP add
+block2.attn.qkv          (4, 16, 384)    float32  B=batch, T=positions, 3C=q|k|v packed side by side
+block2.attn.q            (4, 4, 16, 32)  float32  B=batch, H=heads, T=query positions, D=head width
+block2.attn.k            (4, 4, 16, 32)  float32  B=batch, H=heads, T=key positions, D=head width
+block2.attn.v            (4, 4, 16, 32)  float32  B=batch, H=heads, T=value positions, D=head width
+block2.attn.scores       (4, 4, 16, 16)  float32  B=batch, H=heads, T=query pos, T=key pos (row i = what token i attends to)
+block2.attn.out_heads    (4, 16, 128)    float32  B=batch, T=positions, C=heads re-merged back into the residual width
+block2.block.after_attn  (4, 16, 128)    float32  B=batch, T=positions, C=residual stream after the attention add
+block2.mlp.hidden        (4, 16, 512)    float32  B=batch, T=positions, 4C=widened feature space (per position, independent)
+block2.mlp.out           (4, 16, 128)    float32  B=batch, T=positions, C=projected back to residual width
+block2.block.after_mlp   (4, 16, 128)    float32  B=batch, T=positions, C=residual stream after the MLP add
+block3.attn.qkv          (4, 16, 384)    float32  B=batch, T=positions, 3C=q|k|v packed side by side
+block3.attn.q            (4, 4, 16, 32)  float32  B=batch, H=heads, T=query positions, D=head width
+block3.attn.k            (4, 4, 16, 32)  float32  B=batch, H=heads, T=key positions, D=head width
+block3.attn.v            (4, 4, 16, 32)  float32  B=batch, H=heads, T=value positions, D=head width
+block3.attn.scores       (4, 4, 16, 16)  float32  B=batch, H=heads, T=query pos, T=key pos (row i = what token i attends to)
+block3.attn.out_heads    (4, 16, 128)    float32  B=batch, T=positions, C=heads re-merged back into the residual width
+block3.block.after_attn  (4, 16, 128)    float32  B=batch, T=positions, C=residual stream after the attention add
+block3.mlp.hidden        (4, 16, 512)    float32  B=batch, T=positions, 4C=widened feature space (per position, independent)
+block3.mlp.out           (4, 16, 128)    float32  B=batch, T=positions, C=projected back to residual width
+block3.block.after_mlp   (4, 16, 128)    float32  B=batch, T=positions, C=residual stream after the MLP add
+final.ln                 (4, 16, 128)    float32  B=batch, T=positions, C=residual stream after the final LayerNorm
+logits                   (4, 16, 65)     float32  B=batch, T=positions, V=vocab; logits[b,t,:] scores the token that follows position t
+loss.flat_logits         (64, 65)        float32  B*T=every position flattened into one batch, V=vocab
+loss.flat_targets        (64)            int64    B*T=one correct next-token id per position (-100 = ignored)
+loss                     scalar          float32  scalar: cross-entropy, in nats per token
+
+GRADIENTS (after loss.backward())
+=================================
+
+dL/dW has the shape of W, always: one partial derivative per scalar knob.
+
+parameter.grad               shape       note
+---------------------------  ----------  ----------------------------------------
+wte.weight                   (65, 128)   same shape as the parameter
+wpe.weight                   (128, 128)  same shape as the parameter
+blocks.0.ln_1.weight         (128)       same shape as the parameter
+blocks.0.ln_1.bias           (128)       same shape as the parameter
+blocks.0.attn.c_attn.weight  (384, 128)  same shape as the parameter
+blocks.0.attn.c_attn.bias    (384)       same shape as the parameter
+blocks.0.attn.c_proj.weight  (128, 128)  same shape as the parameter
+blocks.0.attn.c_proj.bias    (128)       same shape as the parameter
+blocks.0.ln_2.weight         (128)       same shape as the parameter
+blocks.0.ln_2.bias           (128)       same shape as the parameter
+blocks.0.mlp.c_fc.weight     (512, 128)  same shape as the parameter
+blocks.0.mlp.c_fc.bias       (512)       same shape as the parameter
+blocks.0.mlp.c_proj.weight   (128, 512)  same shape as the parameter
+blocks.0.mlp.c_proj.bias     (128)       same shape as the parameter
+ln_f.weight                  (128)       same shape as the parameter
+ln_f.bias                    (128)       same shape as the parameter
+
+shape mismatches: 0  (must be 0)
+
+OPTIMIZER STATE (AdamW, after opt.step())
+=========================================
+
+AdamW stores m and v per parameter, both shaped like the parameter.
+That is why Adam costs 3x the memory of the weights alone (W + m + v).
+
+state tensor                            shape       meaning
+--------------------------------------  ----------  ----------------------------------------------------
+wte.weight.exp_avg                      (65, 128)   1st moment m: EMA of the gradient, elementwise
+wte.weight.exp_avg_sq                   (65, 128)   2nd moment v: EMA of the gradient SQUARED, elementwise
+wpe.weight.exp_avg                      (128, 128)  1st moment m: EMA of the gradient, elementwise
+wpe.weight.exp_avg_sq                   (128, 128)  2nd moment v: EMA of the gradient SQUARED, elementwise
+blocks.0.ln_1.weight.exp_avg            (128)       1st moment m: EMA of the gradient, elementwise
+blocks.0.ln_1.weight.exp_avg_sq         (128)       2nd moment v: EMA of the gradient SQUARED, elementwise
+blocks.0.ln_1.bias.exp_avg              (128)       1st moment m: EMA of the gradient, elementwise
+blocks.0.ln_1.bias.exp_avg_sq           (128)       2nd moment v: EMA of the gradient SQUARED, elementwise
+blocks.0.attn.c_attn.weight.exp_avg     (384, 128)  1st moment m: EMA of the gradient, elementwise
+blocks.0.attn.c_attn.weight.exp_avg_sq  (384, 128)  2nd moment v: EMA of the gradient SQUARED, elementwise
+blocks.0.attn.c_attn.bias.exp_avg       (384)       1st moment m: EMA of the gradient, elementwise
+blocks.0.attn.c_attn.bias.exp_avg_sq    (384)       2nd moment v: EMA of the gradient SQUARED, elementwise
+blocks.0.attn.c_proj.weight.exp_avg     (128, 128)  1st moment m: EMA of the gradient, elementwise
+blocks.0.attn.c_proj.weight.exp_avg_sq  (128, 128)  2nd moment v: EMA of the gradient SQUARED, elementwise
+blocks.0.attn.c_proj.bias.exp_avg       (128)       1st moment m: EMA of the gradient, elementwise
+blocks.0.attn.c_proj.bias.exp_avg_sq    (128)       2nd moment v: EMA of the gradient SQUARED, elementwise
+blocks.0.ln_2.weight.exp_avg            (128)       1st moment m: EMA of the gradient, elementwise
+blocks.0.ln_2.weight.exp_avg_sq         (128)       2nd moment v: EMA of the gradient SQUARED, elementwise
+blocks.0.ln_2.bias.exp_avg              (128)       1st moment m: EMA of the gradient, elementwise
+blocks.0.ln_2.bias.exp_avg_sq           (128)       2nd moment v: EMA of the gradient SQUARED, elementwise
+blocks.0.mlp.c_fc.weight.exp_avg        (512, 128)  1st moment m: EMA of the gradient, elementwise
+blocks.0.mlp.c_fc.weight.exp_avg_sq     (512, 128)  2nd moment v: EMA of the gradient SQUARED, elementwise
+blocks.0.mlp.c_fc.bias.exp_avg          (512)       1st moment m: EMA of the gradient, elementwise
+blocks.0.mlp.c_fc.bias.exp_avg_sq       (512)       2nd moment v: EMA of the gradient SQUARED, elementwise
+blocks.0.mlp.c_proj.weight.exp_avg      (128, 512)  1st moment m: EMA of the gradient, elementwise
+blocks.0.mlp.c_proj.weight.exp_avg_sq   (128, 512)  2nd moment v: EMA of the gradient SQUARED, elementwise
+blocks.0.mlp.c_proj.bias.exp_avg        (128)       1st moment m: EMA of the gradient, elementwise
+blocks.0.mlp.c_proj.bias.exp_avg_sq     (128)       2nd moment v: EMA of the gradient SQUARED, elementwise
+ln_f.weight.exp_avg                     (128)       1st moment m: EMA of the gradient, elementwise
+ln_f.weight.exp_avg_sq                  (128)       2nd moment v: EMA of the gradient SQUARED, elementwise
+ln_f.bias.exp_avg                       (128)       1st moment m: EMA of the gradient, elementwise
+ln_f.bias.exp_avg_sq                    (128)       2nd moment v: EMA of the gradient SQUARED, elementwise
+
+optimizer state elements (all blocks): 1,636,096 = 2 x 818,048 parameters

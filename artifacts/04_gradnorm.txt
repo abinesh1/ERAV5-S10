@@ -1,0 +1,68 @@
+lead candidates: 3
+
+step 358: the gradient moved, the loss did not.
+
+  step   grad norm      d(gn)    z(gn)       loss    d(loss)   z(loss)
+--------------------------------------------------------------------------
+   355      1.2320    +0.4251    +1.19     2.2687    +0.0000     +0.60
+   356      0.9055    -0.3265    -0.51     2.2664    -0.0023     -0.04
+   357      0.7677    -0.1378    -1.14     2.2653    -0.0011     -0.35
+   358      1.4292    +0.6615    +2.27     2.2638    -0.0016     -0.79  <-- grad norm jumps here
+   359      1.5253    +0.0961    +1.95     2.2592    -0.0046     -2.14
+   360      0.8291    -0.6962    -0.96     2.2523    -0.0069     -3.31  <-- loss reacts here
+   361      0.7745    -0.0546    -1.02     2.2453    -0.0070     -3.10
+   362      1.1350    +0.3605    +0.40     2.2428    -0.0025     -2.13
+
+grad norm at step 358: 1.4292  (z = +2.27, a 2.3-sigma surprise against its own past)
+loss      at step 358: 2.2638  (z = -0.79, well inside the noise - nothing visible had happened yet)
+loss      at step 360: 2.2523  (z = -3.31, moving -0.0069 in one step)
+
+lag from gradient signal to loss response: 2 step(s).
+
+LAGGED CROSS-CORRELATION
+  lag -6: -0.0625  
+  lag -5: -0.0383  
+  lag -4: +0.0149  
+  lag -3: +0.0340  ##
+  lag -2: +0.0900  #####
+  lag -1: +0.1119  ######
+  lag +0: +0.0481  ##
+  lag +1: +0.0808  ####
+  lag +2: -0.0214  
+  lag +3: -0.0721  
+  lag +4: -0.0813  
+  lag +5: -0.0264  
+  lag +6: +0.1306  #######
+
+SYMMETRY TEST
+  seed  1337: grad-norm-leads   2   loss-leads   2
+  seed     7: grad-norm-leads   5   loss-leads   1
+  seed    21: grad-norm-leads   5   loss-leads   3
+  seed    99: grad-norm-leads   3   loss-leads   3
+  seed  2024: grad-norm-leads   3   loss-leads   1
+  --------------------------------------------
+       total: grad-norm-leads  18   loss-leads  10
+  verdict: grad norm leads 1.80x more often (64% of 28 events)
+  exact two-sided binomial test vs 50/50: p = 0.185  ->  NOT significant at the 5% level
+  so: the lean is in the predicted direction, but 28 events is too
+      few to call it. Reported as suggestive, not established.
+
+INSTABILITY RUN
+step 142: the gradient moved, the loss did not.
+
+  step   grad norm      d(gn)    z(gn)       loss    d(loss)   z(loss)
+--------------------------------------------------------------------------
+   139      0.2257    -0.0455    -1.42     2.8886    +0.0029     -0.59
+   140      0.2464    +0.0207    -0.56     2.8991    +0.0105     +0.56
+   141      0.2581    +0.0118    -0.16     2.9034    +0.0043     +0.98
+   142      0.3254    +0.0673    +2.04     2.8978    -0.0056     +0.22  <-- grad norm jumps here
+   143      0.3381    +0.0126    +1.82     2.8851    -0.0127     -1.33
+   144      0.2298    -0.1083    -1.27     2.8764    -0.0087     -2.11  <-- loss reacts here
+   145      0.3563    +0.1265    +1.95     2.8732    -0.0031     -1.81
+   146      0.2417    -0.1145    -0.92     2.8701    -0.0031     -1.64
+
+grad norm at step 142: 0.3254  (z = +2.04, a 2.0-sigma surprise against its own past)
+loss      at step 142: 2.8978  (z = +0.22, well inside the noise - nothing visible had happened yet)
+loss      at step 144: 2.8764  (z = -2.11, moving -0.0087 in one step)
+
+lag from gradient signal to loss response: 2 step(s).
