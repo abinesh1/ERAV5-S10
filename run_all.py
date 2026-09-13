@@ -30,8 +30,9 @@ from src.gradcheck import autograd_gradcheck, check_one_weight, sweep_h
 from src.gradnorm import (describe_hit, find_lead_steps, instability_run,
                           lag_correlation, lead_symmetry_test, rank_hits)
 from src.model import GPTConfig
-from src.mfu import (compute_mfu, cpu_info, matmul_shape_census, measured_peak,
+from src.mfu import (compute_mfu, device_info, matmul_shape_census,
                      op_attribution, size_sweep)
+from src.model import pick_device
 from src.shapes import trace_one_step
 from src.train import TrainConfig, train
 
@@ -182,10 +183,13 @@ def main():
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--replot", action="store_true",
                     help="rebuild figures from artifacts/results.json, no retraining")
+    ap.add_argument("--device", default=None,
+                    help="cuda / mps / cpu. Default: best available.")
     args = ap.parse_args()
     if args.replot:
         return replot()
     Q = args.quick
+    DEV = pick_device(args.device)
 
     t_start = time.time()
     results = {}
@@ -196,9 +200,13 @@ def main():
     print(f"             {len(text):,} characters, vocab {ds.vocab_size}, sha256[:16] {ds.sha256()}")
     print(f"torch      : {torch.__version__}   threads {torch.get_num_threads()}")
     print(f"python     : {platform.python_version()}")
+    print(f"device     : {DEV}  ({device_info(DEV)['name']})")
+    print(f"             Q2 and the Q3 control are pinned to CPU - they assert")
+    print(f"             bit-exact identities that a GPU may reorder.")
     results["env"] = dict(torch=torch.__version__, python=platform.python_version(),
                           threads=torch.get_num_threads(), corpus_sha=ds.sha256(),
-                          corpus_chars=len(text), vocab=ds.vocab_size, provenance=prov)
+                          corpus_chars=len(text), vocab=ds.vocab_size, provenance=prov,
+                          device=str(DEV), device_name=device_info(DEV)["name"])
 
     # ---------------------------------------------------------------- Q1 shapes
     banner(1, "Every tensor shape in one training step")
@@ -232,7 +240,7 @@ def main():
     print()
     steps = 60 if Q else 300
     print(f"training two identical models for {steps} steps, one per reduction ...")
-    t3, hist = capture(train_both, ds, steps=steps, eval_every=10)
+    t3, hist = capture(train_both, ds, steps=steps, eval_every=10, device=DEV)
     write("03_accumulation.txt", t1 + "\n" + t2 + "\n\nTRAINING BOTH REDUCTIONS\n" + t3)
 
     plot_accumulation(hist, cmp1)
@@ -250,8 +258,8 @@ def main():
     banner(4, "Grad norm every step; find a step where it moved first")
     nsteps = 120 if Q else 400
     print(f"training {nsteps} steps with a fixed probe batch ...")
-    _, log = train(ds, TrainConfig(steps=nsteps, log_every=max(1, nsteps // 4)),
-                   verbose=True, probe=True)
+    _, log = train(ds, TrainConfig(steps=nsteps, log_every=max(1, nsteps // 4),
+                                  device=str(DEV)), verbose=True, probe=True)
     hits, zl, zg = find_lead_steps(log, loss_key="probe_loss")
     print(f"\nlead-step candidates (grad norm surprised, loss did not, loss then moved): {len(hits)}")
     best_txt = ""
@@ -271,7 +279,7 @@ def main():
 
     print("\nsymmetry test - is the lead real, or does noise cut both ways?")
     sym_seeds = (1337, 7) if Q else (1337, 7, 21, 99, 2024)
-    sym_txt, sym = capture(lead_symmetry_test, ds, seeds=sym_seeds,
+    sym_txt, sym = capture(lead_symmetry_test, ds, device=DEV, seeds=sym_seeds,
                            steps=120 if Q else 250)
     results["gradnorm_symmetry"] = dict(forward=sym["forward"], reverse=sym["reverse"],
                                         ratio=sym["ratio"], rows=sym["rows"],
@@ -279,7 +287,7 @@ def main():
                                         seeds=list(sym_seeds))
 
     print("\ncorroboration at large amplitude (high LR, no clipping):")
-    ilog = instability_run(ds, steps=60 if Q else 150)
+    ilog = instability_run(ds, steps=60 if Q else 150, device=DEV)
     ign, ipl = ilog.col("grad_norm"), ilog.col("probe_loss")
     ihits, _, _ = find_lead_steps(ilog, loss_key="probe_loss", warmup=8)
     itxt = ""
@@ -303,10 +311,10 @@ def main():
     # ------------------------------------------------------------------- Q5 MFU
     banner(5, "MFU, honestly")
     cfg = GPTConfig(vocab_size=ds.vocab_size, block_size=128, n_layer=4, n_head=4, n_embd=128)
-    t1, mfu = capture(compute_mfu, ds, cfg, batch_size=16, seq_len=128, reps=20)
+    t1, mfu = capture(compute_mfu, ds, cfg, batch_size=16, seq_len=128, reps=20, device=DEV)
     print()
     peak = mfu["peak"]["gflops"]
-    census = matmul_shape_census(cfg, 16, 128, peak)
+    census = matmul_shape_census(cfg, 16, 128, peak, device=DEV)
     lines = [f"{'matmul':<30} {'M':>6} {'K':>5} {'N':>5} {'x':>2}  {'GFLOP/s':>8}  "
              f"{'% of peak':>9}  {'FLOP share':>10}",
              "-" * 90]
@@ -316,14 +324,17 @@ def main():
                      f"{r['gflops']:>8.1f}  {r['frac_of_peak']:>8.1%}  {r['flops']/tot:>9.1%}")
     t_ideal = sum(r["flops"] / (r["gflops"] * 1e9) for r in census)
     shape_ceiling = tot / t_ideal / 1e9
+    shape_frac = shape_ceiling / peak
+    verdict = ("  (so matmul SHAPE is not the problem here)" if shape_frac > 0.75 else
+               f"  (shapes this small reach only {shape_frac:.0%} of the device's own GEMM\n"
+               f"   ceiling, so SHAPE is a first-order part of the gap)")
     lines += ["", f"FLOP-weighted matmul throughput: {shape_ceiling:.1f} GFLOP/s "
-                  f"= {shape_ceiling/peak:.1%} of peak",
-              "  (so matmul SHAPE is not the problem here)"]
+                  f"= {shape_frac:.1%} of peak", verdict]
     census_txt = "\n".join(lines)
     print(census_txt)
 
     print()
-    attr = op_attribution(ds, cfg)
+    attr = op_attribution(ds, cfg, device=DEV)
     alines = [f"matmul ops (mm/addmm/bmm) : {attr['matmul_frac']:.1%} of step time",
               f"everything else          : {attr['other_frac']:.1%} of step time", "",
               f"(call counts are TOTALS over the {attr['reps']} profiled steps, not per-step)", "",
@@ -336,7 +347,8 @@ def main():
 
     print()
     sweep_cfgs = ((128, 4, 16, 128), (256, 4, 16, 128)) if Q else None
-    t4, sizes = capture(size_sweep, ds, **({"configs": sweep_cfgs} if Q else {}))
+    t4, sizes = capture(size_sweep, ds, device=DEV,
+                        **({"configs": sweep_cfgs} if Q else {}))
     write("05_mfu.txt", t1 + "\nMATMUL SHAPE CENSUS\n" + census_txt +
           "\n\nOPERATOR ATTRIBUTION\n" + attr_txt + "\n\nMFU vs MODEL SIZE\n" + t4)
 
@@ -367,8 +379,13 @@ def main():
     print("  -> artifacts/05_mfu.png")
 
     results["mfu"] = dict(
-        cpu=mfu["cpu"]["name"], cores=mfu["cpu"]["cores"], ghz=mfu["cpu"]["ghz"],
-        isa=mfu["cpu"]["isa"], theoretical_peak_gflops=mfu["cpu"]["theoretical_peak"] / 1e9,
+        device=str(DEV), device_name=mfu["device"]["name"],
+        cores=mfu["device"].get("cores"), ghz=mfu["device"].get("ghz"),
+        isa=mfu["device"].get("isa"),
+        theoretical_peak_gflops=(mfu["device"]["theoretical_peak"] / 1e9
+                                 if mfu["device"].get("theoretical_peak") else None),
+        peak_by_dtype_gflops=mfu["peak"]["by_dtype"],
+        mfu_vs_lowp_ceiling=mfu["mfu_vs_lowp_ceiling"],
         measured_peak_gflops=peak, flops_per_token=mfu["flops"]["per_token"],
         step_flops=mfu["step_flops"], step_ms=mfu["dt"] * 1e3,
         achieved_gflops=mfu["achieved_flops"] / 1e9,

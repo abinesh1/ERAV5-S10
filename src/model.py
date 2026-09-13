@@ -199,3 +199,35 @@ class TinyGPT(nn.Module):
                 tracer.log("loss", loss, "scalar: cross-entropy, in nats per token")
 
         return logits, loss, n_tokens
+
+
+# ---------------------------------------------------------------- device
+
+def pick_device(prefer: str | None = None) -> torch.device:
+    """cuda > mps > cpu. `prefer` overrides, so a cell can pin something to CPU.
+
+    Q2 and the Q3 control stay on CPU on purpose: they assert bit-for-bit
+    identities that a GPU's reduction order is free to break without anything
+    being wrong.
+    """
+    if prefer is not None:
+        return torch.device(prefer)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def sync(device) -> None:
+    """Block until queued work on `device` has actually finished.
+
+    CUDA and MPS launch asynchronously: without this, `time.perf_counter()`
+    around a forward pass measures how long it took to *enqueue* the work, not
+    to do it. Every timing number in Q5 would be fiction.
+    """
+    d = torch.device(device)
+    if d.type == "cuda":
+        torch.cuda.synchronize()
+    elif d.type == "mps":
+        torch.mps.synchronize()

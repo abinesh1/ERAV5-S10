@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from .model import GPTConfig, TinyGPT
+from .model import GPTConfig, TinyGPT, pick_device, sync
 
 
 @dataclass
@@ -31,6 +31,7 @@ class TrainConfig:
     grad_clip: float = 1.0
     seed: int = 1337
     log_every: int = 25
+    device: str | None = None    # None = auto (cuda > mps > cpu)
 
 
 @dataclass
@@ -67,18 +68,22 @@ def lr_at(step: int, cfg: TrainConfig) -> float:
 
 
 def global_grad_norm(model) -> float:
-    """L2 norm of the concatenation of every parameter gradient."""
-    total = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            total += float(p.grad.detach().pow(2).sum())
-    return math.sqrt(total)
+    """L2 norm of the concatenation of every parameter gradient.
+
+    Accumulated on-device and read back once. Calling float() per parameter
+    would force one host sync per tensor, which on a GPU costs more than the
+    norm itself and would show up as "gradnorm" time in the Q5 breakdown.
+    """
+    sq = [p.grad.detach().pow(2).sum() for p in model.parameters() if p.grad is not None]
+    if not sq:
+        return 0.0
+    return float(torch.stack(sq).sum().sqrt())
 
 
 def build(dataset, cfg: TrainConfig, model_cfg: GPTConfig | None = None):
     torch.manual_seed(cfg.seed)
     mcfg = model_cfg or GPTConfig(vocab_size=dataset.vocab_size, block_size=cfg.block_size)
-    model = TinyGPT(mcfg)
+    model = TinyGPT(mcfg).to(pick_device(cfg.device))
     opt = torch.optim.AdamW(
         model.parameters(), lr=cfg.lr, betas=cfg.betas, weight_decay=cfg.weight_decay
     )
@@ -100,6 +105,7 @@ def train(dataset, cfg: TrainConfig, model=None, opt=None, verbose=True,
     """
     if model is None or opt is None:
         model, opt = build(dataset, cfg)
+    dev = next(model.parameters()).device
     gen = torch.Generator().manual_seed(cfg.seed)
     log = TrainLog()
     model.train()
@@ -108,15 +114,16 @@ def train(dataset, cfg: TrainConfig, model=None, opt=None, verbose=True,
     if probe:
         pg = torch.Generator().manual_seed(cfg.seed + 991)
         probe_x, probe_y = dataset.fixed_batch(cfg.batch_size, cfg.block_size,
-                                               split="val", generator=pg)
+                                               split="val", generator=pg, device=dev)
 
     for step in range(cfg.steps):
         lr = lr_at(step, cfg)
         for group in opt.param_groups:
             group["lr"] = lr
 
+        sync(dev)
         t0 = time.perf_counter()
-        x, y = dataset.fixed_batch(cfg.batch_size, cfg.block_size, generator=gen)
+        x, y = dataset.fixed_batch(cfg.batch_size, cfg.block_size, generator=gen, device=dev)
         opt.zero_grad(set_to_none=True)
         _, loss, ntok = model(x, targets=y)
 
@@ -131,6 +138,7 @@ def train(dataset, cfg: TrainConfig, model=None, opt=None, verbose=True,
         if cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         opt.step()
+        sync(dev)
         dt = time.perf_counter() - t0
 
         log.add(StepRecord(step, float(loss.detach()), gnorm, lr, dt, ntok, probe_val))

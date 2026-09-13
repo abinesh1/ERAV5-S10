@@ -157,7 +157,7 @@ def rank_hits(hits):
                                         / max(abs(h["z_loss"]), 0.25)))
 
 
-def instability_run(dataset, lr=1.5e-2, steps=150, seed=1337):
+def instability_run(dataset, lr=1.5e-2, steps=150, seed=1337, device=None):
     """Corroboration at large amplitude: same mechanism, turned up until it is loud.
 
     Run without gradient clipping at a learning rate past the stable range. The
@@ -165,7 +165,7 @@ def instability_run(dataset, lr=1.5e-2, steps=150, seed=1337):
     spike is several times the local baseline and impossible to argue with.
     """
     from .train import TrainConfig, train
-    cfg = TrainConfig(steps=steps, lr=lr, warmup=10, grad_clip=0.0, seed=seed)
+    cfg = TrainConfig(steps=steps, lr=lr, warmup=10, grad_clip=0.0, seed=seed, device=device)
     _, log = train(dataset, cfg, verbose=False, probe=True)
     return log
 
@@ -185,7 +185,7 @@ def _events(driver, follower, g_thresh, quiet, react, horizon, alpha, warmup):
 
 def lead_symmetry_test(dataset, seeds=(1337, 7, 21, 99, 2024), steps=250,
                        g_thresh=2.0, quiet=1.0, react=1.5, horizon=3,
-                       alpha=0.15, warmup=10, verbose=True):
+                       alpha=0.15, warmup=10, verbose=True, device=None):
     """Does the grad norm lead the loss more often than the loss leads the grad norm?
 
     A single anecdote proves nothing, and the lagged correlation on a stable run
@@ -204,7 +204,7 @@ def lead_symmetry_test(dataset, seeds=(1337, 7, 21, 99, 2024), steps=250,
 
     rows = []
     for seed in seeds:
-        cfg = TrainConfig(steps=steps, seed=seed)
+        cfg = TrainConfig(steps=steps, seed=seed, device=device)
         _, log = train(dataset, cfg, verbose=False, probe=True)
         gn = log.col("grad_norm")
         pl = log.col("probe_loss")

@@ -37,12 +37,13 @@ import copy
 import torch
 
 from .data import skewed_lengths
-from .model import GPTConfig, TinyGPT
+from .model import GPTConfig, TinyGPT, pick_device
 from .train import lr_at, TrainConfig
 
 
-def make_micro_batches(dataset, lengths_per_micro, generator=None):
-    return [dataset.varlen_batch(L, generator=generator) for L in lengths_per_micro]
+def make_micro_batches(dataset, lengths_per_micro, generator=None, device=None):
+    return [dataset.varlen_batch(L, generator=generator, device=device)
+            for L in lengths_per_micro]
 
 
 def accumulate_grads(model, micro_batches, mode: str):
@@ -169,10 +170,12 @@ def eval_loss(model, dataset, n_batches=20, batch_size=16, block_size=128, seed=
     curves are comparable.
     """
     model.eval()
+    dev = next(model.parameters()).device
     gen = torch.Generator().manual_seed(seed)
     tot_loss, tot_tok = 0.0, 0
     for _ in range(n_batches):
-        x, y = dataset.fixed_batch(batch_size, block_size, split="val", generator=gen)
+        x, y = dataset.fixed_batch(batch_size, block_size, split="val", generator=gen,
+                                   device=dev)
         _, loss_sum, n = model(x, targets=y, loss_reduction="sum")
         tot_loss += float(loss_sum)
         tot_tok += n
@@ -181,16 +184,20 @@ def eval_loss(model, dataset, n_batches=20, batch_size=16, block_size=128, seed=
 
 
 def train_both(dataset, steps=200, n_micro=4, micro_bs=8, lo=16, hi=128,
-               lr=3e-3, seed=1337, eval_every=10, verbose=True):
+               lr=3e-3, seed=1337, eval_every=10, verbose=True, device=None):
     """Two identical models, identical data stream, different reductions.
 
     Same init, same seed, same micro-batches at every step. The ONLY difference
     is how the micro-batch losses are combined.
+
+    This one runs on the accelerator when there is one - it is 300 steps x 2
+    models x 4 micro-batches and nothing here asserts a bit-exact identity.
     """
+    dev = pick_device(device)
     torch.manual_seed(seed)
     cfg = GPTConfig(vocab_size=dataset.vocab_size, block_size=hi,
                     n_layer=4, n_head=4, n_embd=128, dropout=0.0)
-    base = TinyGPT(cfg)
+    base = TinyGPT(cfg).to(dev)
 
     models = {"correct": copy.deepcopy(base), "mean_of_means": copy.deepcopy(base)}
     opts = {k: torch.optim.AdamW(m.parameters(), lr=lr, betas=(0.9, 0.95),
@@ -202,7 +209,7 @@ def train_both(dataset, steps=200, n_micro=4, micro_bs=8, lo=16, hi=128,
     gen = torch.Generator().manual_seed(seed)
     for step in range(steps):
         lengths = skewed_lengths(n_micro, micro_bs, lo, hi, gen)
-        micro = make_micro_batches(dataset, lengths, gen)
+        micro = make_micro_batches(dataset, lengths, gen, device=dev)
         lr_now = lr_at(step, tcfg)
 
         for mode, model in models.items():

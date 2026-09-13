@@ -89,17 +89,24 @@ class CharDataset:
 
     # ---------------- fixed-length ----------------
 
-    def fixed_batch(self, batch_size: int, block_size: int, split="train", generator=None):
-        """(B, T) inputs and (B, T) next-token targets. Every row is full length."""
+    def fixed_batch(self, batch_size: int, block_size: int, split="train", generator=None,
+                    device=None):
+        """(B, T) inputs and (B, T) next-token targets. Every row is full length.
+
+        Sampling always happens on the CPU generator and the result is moved
+        afterwards, so a given seed draws the *same* batch on CPU, MPS and CUDA.
+        """
         src = self.train if split == "train" else self.val
         ix = torch.randint(len(src) - block_size - 1, (batch_size,), generator=generator)
         x = torch.stack([src[i:i + block_size] for i in ix])
         y = torch.stack([src[i + 1:i + 1 + block_size] for i in ix])
+        if device is not None:
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         return x, y
 
     # ---------------- variable-length ----------------
 
-    def varlen_batch(self, lengths, split="train", generator=None):
+    def varlen_batch(self, lengths, split="train", generator=None, device=None):
         """Rows of differing true length, right-padded.
 
         Returns (x, y, pad_mask, n_real_tokens):
@@ -119,6 +126,8 @@ class CharDataset:
             x[b, :L] = src[i:i + L]
             y[b, :L] = src[i + 1:i + 1 + L]
             mask[b, :L] = True
+        if device is not None:
+            x, y, mask = (t.to(device, non_blocking=True) for t in (x, y, mask))
         return x, y, mask, int(sum(lengths))
 
 
