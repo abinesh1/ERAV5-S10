@@ -20,8 +20,10 @@ a longer or less stable run could diverge.
 
 **§5 is different, and deliberately so.** MFU is a statement about a specific device, so
 it is reported against that device's own *measured* ceilings and names the machine every
-time it quotes a number. The same model scores 31.7% on the Xeon and 15.1% on the T4, and
-neither number is wrong — they have different denominators. §5 shows both.
+time it quotes a number. The same model scores **31.7%** on the Xeon, **13.06%** on a
+Tesla T4, and **1.90%** on that same T4 against the tensor-core ceiling the published "40%
+MFU" figures actually use. None of the three is wrong; they are three different
+denominators. §5 reports all of them and says which is which.
 
 ## The answers, at a glance
 
@@ -31,7 +33,7 @@ neither number is wrong — they have different denominators. §5 shows both.
 | 2 | verify one gradient by hand | central difference vs `backward()` agree to **8.0 decimal digits** (best 8.8); `torch.autograd.gradcheck` passes |
 | 3 | break gradient accumulation | mean-of-means rotates the gradient by **4.63°** (cos 0.9967) and costs **+0.0329 nats/token** after 300 steps |
 | 4 | grad norm moving before the loss | one clear example (step 358, 2.3σ, loss reacts 2 steps later) - but symmetry test 18:10, **p=0.18, not significant** |
-| 5 | MFU, and the distance to 40% | *(CPU reference run)* **31.7%** of the measured ceiling, 27.9% of theoretical. The gap is non-matmul overhead (50% of the step), not kernels or the machine - 40% is crossed by widening the model. On a GPU the dominant term is different and is measured separately: fp32 leaves the tensor cores idle, so the denominator the 40% figures use is several times larger |
+| 5 | MFU, and the distance to 40% | **13.06%** of the T4's measured fp32 ceiling - but **1.90%** against the tensor-core ceiling the 40% figures actually use (31.7% on a Xeon CPU). Ranked causes, measured: dtype **6.9x**, shapes **~5x** (20.6% of GEMM peak), non-matmul overhead **~1.7x** (only 21.9% of kernel time is matmul). Two of my own measurement bugs inflated this before the GPU run caught them |
 | 6 | 0.1 in fp32 / bf16 / fp8 E4M3 | `0x3DCCCCCD` / `0x3DCD` / `0x1D`, all matching hardware; train in **bf16 for matmuls, fp32 for anything that accumulates** |
 
 Two of these did not come out the way I expected, and §4 in particular reports a **negative**
@@ -596,219 +598,309 @@ prints all of them and labels which is which.
 > and cannot touch the tensor cores at all. Comparing its MFU to 40% without saying that
 > is comparing two different fractions. §5(d) puts a measured number on the gap.
 
-#### Reference run — 4-core Xeon, CPU, fp32
+#### The two machines
 
-The numbers in this section are from a CPU reference run, kept because they are a
-complete worked example. **Re-run the notebook on a GPU and every one of them
-changes** — the final cell prints the replacements as JSON.
+Everything below was measured on a **Tesla T4** (Colab), with the earlier 4-core Xeon run
+kept beside it. Two machines is not padding: they disagree about *which* thing is costing
+the efficiency, and the disagreement is the most useful result in this section.
 
-| | |
-|---|---|
-| CPU | Intel(R) Xeon(R) Processor @ 2.10GHz |
-| topology | 4 physical cores @ 2.1 GHz, AVX-512 |
-| FLOPs/cycle/core | 16 fp32 lanes × 2 (FMA) × 2 ports = 64 |
-| **theoretical fp32 peak** | **537.6 GFLOP/s** |
-| **measured SGEMM ceiling** | **472.7 GFLOP/s** (87.9% of theoretical) |
+| | Intel Xeon @ 2.10GHz (4 cores) | **Tesla T4** |
+|---|---|---|
+| units | AVX-512, 16 fp32 lanes × 2 FMA × 2 ports = 64 FLOP/cycle/core | 40 SMs, compute capability 7.5, 15.6 GB |
+| low precision | AMX / AVX-512-bf16 present, unreachable from eager fp32 | fp16 tensor cores; **no** native bf16, **no** TF32 |
+| datasheet fp32 | 537.6 GFLOP/s | 8.10 TFLOP/s |
+| **measured fp32 GEMM** | **472.7 GFLOP/s** (87.9% of datasheet) | **6.08 TFLOP/s** (75.1% of datasheet) |
+| datasheet tensor-core | — | 65 TFLOP/s (fp16) |
+| **measured fp16 GEMM** | — | **41.75 TFLOP/s** (64% of datasheet) |
 
-That the measured ceiling lands at 88% of theoretical is itself a check: it says the
-64-FLOPs/cycle model of this CPU is right. On a GPU the same check is more interesting,
-because a small-model workload typically reaches a far smaller fraction of its datasheet
-number — which is the point §5(a) and §5(c) exist to test.
+On the CPU the measured ceiling lands at 88% of datasheet, which is itself a check: the
+64-FLOP/cycle model of that part is right. The T4 reaches 75% in fp32 and 64% in fp16 —
+lower, and expected, because a GPU's datasheet number assumes every SM is saturated.
+
+> **A bug this table used to hide.** The first T4 run reported bf16 at 2.38 TFLOP/s and
+> TF32 at 4.08 — both *slower* than the same card's fp32. A T4 is Turing: it has neither.
+> `torch.cuda.is_bf16_supported()` returns `True` there because PyTorch counts *emulation*,
+> so the code benchmarked emulated bf16 and called it a tensor-core ceiling. Dividing by it
+> scored **38.7%**, which reads as "nearly 40%" only because the denominator was slow.
+> The dtype is now chosen from the compute capability (`sm_75 → fp16`), and a
+> low-precision ceiling that measures slower than fp32 is refused as a denominator rather
+> than published. The honest number for the same run is **1.90%**. A twenty-fold
+> correction, entirely in the unflattering direction, and it only appeared because the
+> ceiling was *measured* instead of read off a spec sheet.
 
 ### The result
 
-| | |
-|---|---|
-| FLOPs per token (fwd+bwd) | 5,554,944 |
-| — of which attention (non-parameter) | 14.2% of the forward pass |
-| FLOPs per step (B=16, T=128) | 11.3765 GFLOP |
-| measured step time | 75.93 ms (26,973 tokens/s) |
-| achieved | **149.84 GFLOP/s** |
-| **MFU vs theoretical peak** | **27.87%** |
-| **MFU vs measured ceiling** | **31.70%** |
+| | Xeon (CPU) | **Tesla T4** |
+|---|---|---|
+| FLOPs per token (fwd+bwd) | 5,554,944 | 5,554,944 |
+| — of which attention (non-parameter) | 14.2% of forward | 14.2% of forward |
+| FLOPs per step (B=16, T=128) | 11.3765 GFLOP | 11.3765 GFLOP |
+| measured step time | 75.93 ms (26,973 tok/s) | **14.32 ms** (143,051 tok/s) |
+| achieved | 149.84 GFLOP/s | **794.64 GFLOP/s** |
+| MFU vs datasheet fp32 | 27.87% | 9.81% |
+| **MFU vs measured fp32 ceiling** | **31.70%** | **13.06%** |
+| **MFU vs measured tensor-core** | — | **1.90%** |
+
+Read the last two rows together, because this is the whole point of §5. The *same model*,
+5.3× faster in wall-clock on the T4, scores **less than half** the CPU's MFU against fp32
+and **1.90%** against the denominator the published 40% figures actually use. None of those
+four numbers is wrong. They are four different fractions, and quoting one without its
+denominator is how "40% MFU" becomes meaningless.
 
 ### What is costing me the distance to 40%?
 
 Four candidate explanations. I measured all four rather than picking a favourite.
 
-**(a) Are the matmul shapes bad?** A matmul with a small `K` or `N` cannot saturate a vector
-unit however good the kernel is, and this is a small model — so this is the obvious suspect.
-Benchmarking every matmul shape the forward pass actually issues:
+**(a) Are the matmul shapes bad?** A matmul with a small `K` or `N` cannot saturate a
+vector unit however good the kernel is, and this is a small model — so this is the obvious
+suspect. Benchmarking every matmul shape the forward pass actually issues, on both machines:
 
 ```
-matmul                              M     K     N  x   GFLOP/s  % of peak  FLOP share
+Tesla T4                            M     K     N  x   GFLOP/s  % of peak  FLOP share
 ------------------------------------------------------------------------------------------
-c_attn   (B*T,C)x(C,3C)          2048   128   384  4     523.7    110.8%      21.2%
-attn QK^T per head               8192    32   128  4     446.0     94.3%       7.1%
-attn AV   per head               8192   128    32  4     452.7     95.8%       7.1%
-attn c_proj (B*T,C)x(C,C)        2048   128   128  4     497.8    105.3%       7.1%
-mlp c_fc  (B*T,C)x(C,4C)         2048   128   512  4     500.1    105.8%      28.3%
-mlp c_proj (B*T,4C)x(4C,C)       2048   512   128  4     301.1     63.7%      28.3%
-lm_head  (B*T,C)x(C,V)           2048   128    65  1     336.1     71.1%       0.9%
+c_attn   (B*T,C)x(C,3C)          2048   128   384  4    1242.6     20.4%      21.2%
+attn QK^T per head               8192    32   128  4     848.2     13.9%       7.1%
+attn AV   per head               8192   128    32  4     747.9     12.3%       7.1%
+attn c_proj (B*T,C)x(C,C)        2048   128   128  4    1063.9     17.5%       7.1%
+mlp c_fc  (B*T,C)x(C,4C)         2048   128   512  4    1352.3     22.2%      28.3%
+mlp c_proj (B*T,4C)x(4C,C)       2048   512   128  4    1762.0     29.0%      28.3%
+lm_head  (B*T,C)x(C,V)           2048   128    65  1     686.6     11.3%       0.9%
 
-FLOP-weighted matmul throughput: 417.3 GFLOP/s = 88.3% of peak
-  (so matmul SHAPE is not the problem here)
+FLOP-weighted matmul throughput: 1252.0 GFLOP/s = 20.6% of peak
 ```
 
-**Verdict: not guilty.** The FLOP-weighted throughput of these shapes is **88.3%** of peak
-— the slowest in this run were `mlp c_proj` (64% of peak, N=128) and `lm_head` (71% of peak, N=65), both held back by a narrow output dimension, and the fastest reached 111%. Nothing here is leaving a factor of three on the table for want of a better shape.
+**Verdict: guilty on the GPU, not guilty on the CPU — and that is the interesting part.**
+
+| | Xeon | Tesla T4 |
+|---|---|---|
+| FLOP-weighted matmul throughput | 417.3 GFLOP/s | 1252.0 GFLOP/s |
+| as a fraction of that device's own GEMM ceiling | **88.3%** | **20.6%** |
+
+Identical shapes, opposite verdicts. On four CPU cores, `(2048×128)·(128×384)` is a
+perfectly respectable matmul — enough rows to keep the vector units fed, and small enough
+to run cache-resident. On 40 SMs it is *nowhere near* enough work: 2048 rows spread over
+40 multiprocessors with a K of 128 leaves most of the machine idle, and every shape in the
+table lands between 11% and 29% of what the same card does on a 4096² GEMM. The narrow
+dimensions that merely cost the CPU a few percent (`lm_head` at N=65) cost the GPU ~5×.
+
+This is the single clearest lesson in §5: **"is my matmul shape a problem" has no
+device-independent answer.** The CPU run's conclusion — quoted verbatim in this README
+before the GPU run existed — was "so matmul SHAPE is not the problem here." That was true,
+and it was true only of that machine.
 
 Two honest caveats about this benchmark, because both matter for reading (b):
 
-- **Some rows read above 100% of "peak".** That is not an error; it is the measured ceiling
-  being the wrong yardstick for these shapes. The ceiling came from a 1024²/2048² SGEMM whose
-  operands do not fit in cache, whereas several of these matmuls are small enough to run
-  cache-resident and therefore beat it. It is a reminder that "peak" is a property of a
-  workload, not just of a chip.
+- **Some CPU rows read above 100% of "peak".** Not an error: the measured ceiling came from
+  a 1024²/2048² SGEMM whose operands do not fit in cache, whereas several of these matmuls
+  are small enough to run cache-resident and therefore beat it. "Peak" is a property of a
+  workload, not just of a chip. No T4 row does this — on a GPU these shapes are nowhere near
+  the ceiling.
 - **These are hot-loop timings.** Each matmul runs repeatedly on the same operands, so its
-  caches are warm in a way the real forward pass's never are. This is an **upper** bound on
-  in-situ matmul throughput — which is exactly why (b)'s arithmetic below comes out optimistic
-  against the measured MFU rather than landing on it.
+  caches are warm in a way the real forward pass's never are. An **upper** bound on in-situ
+  matmul throughput — which is why (b)'s arithmetic comes out optimistic against the
+  measured MFU rather than landing on it.
 
 **(b) How much of the step is matmul at all?** Only `mm`/`addmm`/`bmm` earn model FLOPs.
 Softmax, GELU, LayerNorm, the causal `masked_fill`, the transpose copies and the AdamW update
-all cost wall clock and earn exactly nothing. Profiling by operator:
+all cost wall clock and earn exactly nothing. Profiling by operator — on the GPU this counts
+**device kernel time**, not CPU launch time, which is the only meaningful denominator there:
 
 ```
-matmul ops (mm/addmm/bmm) : 49.6% of step time
-everything else          : 50.4% of step time
+Tesla T4
+matmul ops      : 21.9% of step time
+everything else : 78.1% of step time
 
 (call counts are TOTALS over the 5 profiled steps, not per-step)
 
 operator                              self %    calls
 ------------------------------------------------------
-aten::mm                              27.8%      175  <- matmul
-aten::addmm                           11.6%       80  <- matmul
-aten::bmm                             10.1%      120  <- matmul
-aten::copy_                            9.7%     1605
-aten::gelu_backward                    3.4%       20
-aten::masked_fill_                     3.1%       40
-Optimizer.step#AdamW.step              2.4%        5
-aten::mul                              2.3%       40
-aten::sum                              2.3%       90
-aten::native_layer_norm_backward       2.0%       45
-aten::_softmax                         1.8%       20
-aten::gelu                             1.7%       20
-aten::add_                             1.4%      560
-aten::cat                              1.3%       20
-aten::_softmax_backward_data           1.3%       20
-aten::mul_                             1.3%      520
-aten::native_layer_norm                1.0%       45
-aten::add                              0.9%       50
+aten::mm                              10.4%      175  <- matmul
+Optimizer.step#AdamW.step              7.0%        5
+volta_sgemm_128x64_nn                  6.0%      105
+aten::addmm                            5.9%       80  <- matmul
+aten::bmm                              5.5%      120  <- matmul
+volta_sgemm_128x64_tn                  5.3%       80
+aten::copy_                            4.0%      185
+volta_sgemm_64x64_nt                   3.4%       60
+aten::mul                              3.4%       60
+volta_sgemm_64x64_tn                   2.7%       40
+aten::sum                              2.5%       90
+reduce_kernel<128, 4, ReduceOp<float, ...>>   2.5%   85
 ```
 
-**This is the answer.** Only **49.6% of the step is in matmuls**; the other
-**50.4% earns no FLOP credit at all.** And the arithmetic closes:
+**This is a real part of the answer on both machines**, and the arithmetic closes the same
+way on each:
 
-```
-MFU / matmul share  =  31.7% / 49.6%  =  63.9%
-```
-
-which is what MFU would be if every non-matmul operation were free.
-
-Where that non-matmul half actually goes:
-
-| phase | ms | share of step |
+| | Xeon | Tesla T4 |
 |---|---|---|
-| `data` | 0.43 | 0.6% |
-| `forward` | 25.41 | 33.5% |
-| `backward` | 41.12 | 54.2% |
-| `gradnorm` | 2.53 | 3.3% |
-| `clip` | 1.52 | 2.0% |
-| `opt` | 4.73 | 6.2% |
+| matmul share of step | 49.6% | **21.9%** |
+| earns no FLOP credit | 50.4% | **78.1%** |
+| MFU ÷ matmul share | 31.7 / 49.6 = **63.9%** | 13.06 / 21.88 = **59.7%** |
 
-Two things worth naming in that table:
+That last row is what MFU would be if every non-matmul operation were free. Both machines
+land near 60%, from very different starting points — the shortfall from 100% is (a), the
+shapes, and the shortfall from 60% to the real MFU is (b), the overhead.
 
-- **The optimizer step is 6.2% of wall clock for a model this small.** AdamW touches
-  `W`, `grad`, `m` and `v` — four reads/writes over every parameter — and does almost no
-  arithmetic. It is pure memory bandwidth, and it earns zero model FLOPs.
-- **`gradnorm` + `clip` is 5.3% of the step, and that is my own instrumentation.**
-  Logging the pre-clip grad norm every step for §4 costs real MFU. Honest accounting means
-  admitting that measuring the run slows the run.
+Where the step time actually goes:
+
+| phase | Xeon ms | Xeon share | **T4 ms** | **T4 share** |
+|---|---|---|---|---|
+| `data` | 0.43 | 0.6% | 0.72 | 5.0% |
+| `forward` | 25.41 | 33.5% | 4.28 | 29.9% |
+| `backward` | 41.12 | 54.2% | 5.55 | 38.8% |
+| `gradnorm` | 2.53 | 3.3% | 1.97 | **13.7%** |
+| `clip` | 1.52 | 2.0% | 0.75 | 5.2% |
+| `opt` | 4.73 | 6.2% | 1.05 | 7.3% |
+
+> **How much to trust those milliseconds.** Timing a phase on an async device requires a
+> barrier at its boundary, and barriers drain the pipeline. So the step is timed twice: once
+> clean (one barrier at each end) for MFU, once barriered for attribution. On this T4 run the
+> clean step was 14.32 ms and the barriered sum 11.96 ms, so the per-phase figures are scaled
+> by ×1.20 to sum to the real step. **The shares are the trustworthy column; the absolute
+> milliseconds are indicative.** `compute_mfu` now prints that factor whenever the two passes
+> disagree by more than 2%, in either direction, rather than adjusting silently.
+
+Three things worth naming:
+
+- **The optimizer step costs more, relatively, on the faster machine** (6.2% → 7.3%). AdamW
+  touches `W`, `grad`, `m` and `v` — four reads/writes per parameter — and does almost no
+  arithmetic. It is pure memory bandwidth, so it does not shrink when the matmuls get 5×
+  faster. Every fixed-cost element of the step behaves this way, which is why accelerating a
+  small model raises wall-clock far more than it raises MFU.
+- **`gradnorm` + `clip` is 18.9% of the T4 step — up from 5.3% on the CPU.** That is my own
+  instrumentation. Logging the pre-clip grad norm every step for §4 costs real MFU, and it
+  costs proportionally *more* the faster the device, because it is a reduction over every
+  parameter plus a host sync. Honest accounting means admitting that measuring the run slows
+  the run, and that the price rises with the hardware.
+- **`data` went from 0.6% to 5.0%** for the same reason: host-side batch assembly did not get
+  faster, so it grew as a share of a step that did.
 
 **(c) Is it the machine, or the model size?** These two hypotheses make opposite predictions.
-If low MFU were something fundamental about this CPU, growing the model would not help. If it
+If low MFU were something fundamental about the device, growing the model would not help. If it
 is fixed per-step overhead that does not scale with C², growing the model fixes it. That is
 decidable by experiment — batch, sequence length and depth held fixed, width the only variable:
 
 ```
+Tesla T4 — all points divided by ONE ceiling measured up front: 5.51 TFLOP/s fp32
 n_embd layers   B    T      params  ms/step  GFLOP/s     MFU
 ---------------------------------------------------------------
-   128      4  16  128     818,048     67.0    169.9   33.5%
-   192      4  16  128   1,816,896    142.5    170.6   33.8%
-   256      4  16  128   3,208,960    167.5    251.2   50.7%
-   384      4  16  128   7,172,736    339.0    271.7   53.0%
-   512      4  16  128  12,709,376    565.6    285.5   58.6%
+   128      4  32  256     834,432     38.8   1340.2   24.3%
+   256      4  32  256   3,241,728     80.0   2266.1   41.1%
+   512      4  32  256  12,774,912    238.3   2818.7   51.1%
+   768      4  32  256  28,599,552    495.7   2968.0   53.8%
+  1024      4  32  256  50,715,648    796.8   3238.1   58.7%
 ```
 
-![mfu](artifacts/05_mfu.png)
+![mfu — Tesla T4](artifacts/05_mfu_t4.png)
 
-**40% is crossed between C=192 (33.8%) and C=256 (50.7%), and the curve then plateaus around 59%.** Nothing
-about the machine changed. The whole deficit at C=128 was that elementwise work scales with
-`C` while matmul work scales with `C²`, so at small width the fixed overhead dominates —
-and the plateau lands in the same region as the 63.9% "if overhead were free" figure
-predicted from the small model's operator breakdown — close enough to corroborate the
-diagnosis, not so close that I would claim the two numbers were measuring the same thing.
+*(T4 run. `artifacts/05_mfu.png` is the same figure from the CPU reference run. The
+right-hand panel's title is the notebook's own, written before the GPU run existed — on a
+GPU it is a size problem **and** a dtype problem, and (d) is the larger of the two.)*
 
-**(d) Is it the dtype?** On a GPU this is the first-order term, and it is pure
-bookkeeping rather than a kernel problem. The model trains in fp32, so every matmul runs
-on the CUDA cores; the tensor cores sit idle. `measured_peak` times a large GEMM in each
-dtype the device supports, so the size of that choice is measured rather than asserted:
+**Verdict: size, decisively.** Throughput goes **1340 → 3238 GFLOP/s, a 2.4× gain from
+width alone**, on hardware that did not change. 40% against the fp32 ceiling is crossed
+at C=256, and the curve then flattens around 59% — the same region as the "if overhead
+were free" figure in (b), which corroborates the diagnosis without my claiming the two
+numbers measure the same thing. The CPU sweep says the same thing on its own scale
+(33.5% → 58.6%, crossing 40% between C=192 and C=256).
+
+> **This table used to read 30.7 / 56.4 / 77.7 / 84.3 / 88.0%.** Those numbers were wrong,
+> and wrong in the flattering direction, because each point re-measured its own ceiling.
+> On a 70 W passively-cooled T4 the ceiling *falls* as the sweep heats the card — 4210,
+> 3859, 3396, 3265, 3330 GFLOP/s against 6094 measured before the sweep began — so the
+> denominator was shrinking underneath exactly the wide configurations the sweep exists to
+> judge. One ceiling is now measured up front and shared by every point. The upward trend
+> was real; its steepness was thermal. **An MFU curve whose denominator moves is not a
+> measurement of the model, it is a measurement of the cooling.**
+
+**(d) Is it the dtype?** On a GPU this is the **largest single term**, and it is pure
+bookkeeping rather than a kernel problem. The model trains in fp32, so every matmul runs on
+the CUDA cores and the tensor cores sit idle for the whole run. `measured_peak` times a large
+GEMM in each dtype the part actually supports, so the size of that choice is measured:
 
 ```
-measured GEMM ceilings on this device (what it really reaches):
-  fp32   <fp32 ceiling>  TFLOP/s
-  tf32   <tf32 ceiling>  TFLOP/s      <- Ampere and later only
-  bf16   <bf16 ceiling>  TFLOP/s      <- what the 40% figures are quoted against
+Tesla T4 — measured GEMM ceilings (what it really reaches):
+  fp32      6.08 TFLOP/s  =  75.1% of datasheet fp32
+  fp16     41.75 TFLOP/s                                <- the tensor cores
+  -> the model trains in fp32, so its ceiling is 6.08 TFLOP/s
+  -> leaving 6.9x on the table by not using the tensor cores at all
 ```
 
-and `compute_mfu` then divides the *same* achieved throughput by each of them:
+**6.9×.** That is the price of the dtype, measured on the card the run happened on, and it
+dwarfs every other term in this section. `compute_mfu` then divides the *same* achieved
+794.64 GFLOP/s by each defensible denominator:
 
-| denominator | MFU | what it means |
-|---|---|---|
-| datasheet fp32 | lowest | vendor optimism, useful only as a sanity check |
-| measured fp32 | **the honest one** | how well this code uses the units it actually runs on |
-| measured bf16/tensor-core | lowest of all | the denominator the published 40% figures use |
+| denominator | value | MFU | what it means |
+|---|---|---|---|
+| datasheet fp32 | 8.10 TFLOP/s | 9.81% | vendor optimism; a sanity check, nothing more |
+| **measured fp32** | **6.08 TFLOP/s** | **13.06%** | how well this code uses the units it actually runs on |
+| **measured fp16 tensor-core** | **41.75 TFLOP/s** | **1.90%** | the denominator the published 40% figures use |
 
-The trap: switching to bf16 raises the numerator *and* the denominator. It is a large
-**wall-clock** win and can easily be a *smaller* MFU number. Wall-clock and MFU are
-different questions, and reporting a speedup as an efficiency gain is the most common way
-MFU gets misquoted. On the CPU reference run this candidate is nearly moot — there is no
-matrix engine eager fp32 PyTorch can reach — which is exactly why the notebook measures it
-per device instead of hardcoding a conclusion.
+**So against the denominator the "40% MFU" claims are actually quoted against, this run is
+at 1.90%, not 13% and certainly not 31.7%.** That is the honest answer to the question, and
+it is three numbers apart from the flattering one.
+
+The trap that makes this subtle: switching to fp16/bf16 raises the numerator *and* the
+denominator. It is a large **wall-clock** win that can easily produce a *smaller* MFU number.
+Wall-clock and MFU are different questions, and reporting a speedup as an efficiency gain is
+the most common way MFU gets misquoted. On the CPU this candidate is nearly moot — there is
+no matrix engine eager fp32 PyTorch can reach — which is exactly why this is measured per
+device rather than concluded once. See §6 for why bf16, not fp16, is the right choice when
+the hardware offers it.
 
 ### So, honestly
 
-On the CPU reference run, at the configuration actually being trained here —
-`n_embd=128`, 818K params, on 4 CPU cores —
-**MFU is 31.7% against the measured ceiling and 27.9% against theoretical peak.** The
-distance to 40% is *not* bad kernels, *not* the attention term (only 14.2% of forward
-FLOPs at T=128), and *not* the machine. It is that **the model is too small to amortise its own
-per-step overhead**, and about 5.3% of it is the price of the instrumentation this repo
-exists to demonstrate.
+At the configuration actually being trained — `n_embd=128`, 818K params, B=16, T=128 —
+here is every MFU this run can honestly claim, on two machines:
 
-**On a GPU the ordering changes, and (d) moves to the top.** A 4-layer 128-wide model
-issuing 2048-token matmuls cannot fill an accelerator built for matrices two orders of
-magnitude larger, and it is running in the one dtype that leaves the tensor cores idle.
-Expect a much smaller MFU there than on the CPU — and that is not the GPU being worse,
-it is a much larger denominator being divided into the same small model. The size sweep
-in (c) is the experiment that separates those two readings; run it on the GPU and the
-curve should climb far more steeply with width than the CPU one does.
+| | Xeon (4 cores) | Tesla T4 |
+|---|---|---|
+| vs datasheet fp32 | 27.87% | 9.81% |
+| vs measured fp32 ceiling | **31.70%** | **13.06%** |
+| vs measured tensor-core ceiling | — | **1.90%** |
 
-Three things would close the gap, in descending order of effect:
+**The distance to 40% is not one thing, and the ranking is device-dependent.** In order of
+size on the T4:
 
-1. **Make the model wider.** Demonstrated above — the single biggest lever, and free of any
-   cleverness.
-2. **Fuse the elementwise work.** `torch.compile` or a fused attention kernel would collapse
-   most of the softmax / mask / transpose-copy traffic. The `aten::copy_` line in the profile
-   above (call counts there are totals over 5 profiled steps, so divide by 5 for per-step)
-   is mostly `.contiguous()` after `.transpose()` — pure memory movement earning no FLOPs.
-3. **Use bf16 for the matmuls.** This machine has AMX and AVX-512-bf16 (see the table above),
-   neither of which fp32 eager PyTorch can reach. Worth being precise about what that buys,
-   though: it would cut wall-clock time substantially, but it would **not** necessarily raise
-   *MFU*, because the bf16 peak is several times the fp32 peak — the denominator moves too.
-   Wall-clock and MFU are different questions, and conflating them is an easy way to report a
-   speedup as an efficiency gain. See §6 for why bf16 is nonetheless the right precision here.
+1. **The dtype — 6.9×.** Training in fp32 leaves the tensor cores idle for the entire run.
+   This single choice is worth more than every other term combined, and it is why the
+   tensor-core-denominated MFU is 1.90% rather than 13%.
+2. **The shapes — ~5×.** The matmuls this model issues reach only **20.6%** of the T4's own
+   fp32 GEMM ceiling. 2048 rows across 40 SMs with K=128 does not fill the machine. On the
+   CPU the identical shapes reached **88.3%**, so this term is ~0 there — the same model,
+   the opposite verdict.
+3. **Non-matmul overhead — ~1.7×.** Only **21.9%** of device kernel time is in a matmul.
+   Correcting for it alone would give 59.7%, which is the "if overhead were free" ceiling.
+4. **The attention term is *not* a culprit** on either machine: 14.2% of forward FLOPs at
+   T=128, and it is counted dense because this implementation computes the full square and
+   masks. It would matter at long context and does not here.
+
+Of that overhead, **18.9% of the T4 step is `gradnorm` + `clip`** — my own instrumentation,
+up from 5.3% on the CPU. Logging a pre-clip grad norm every step for §4 costs real
+efficiency, and it costs *proportionally more* the faster the device, because a reduction
+over every parameter plus a host sync does not shrink when the matmuls get 5× faster. The
+repo measures itself, and the measurement is on the bill.
+
+**What would actually close it**, in descending order of effect on the T4:
+
+1. **Use the tensor cores.** bf16 where the hardware has it, fp16 with loss scaling on
+   Turing. Worth 6.9× of ceiling. But be precise about what it buys: it raises the numerator
+   *and* the denominator, so it is a large wall-clock win that may well *lower* MFU. §6 is
+   the argument for which format, and why the accumulations stay fp32 regardless.
+2. **Make the model wider.** Demonstrated in (c): 2.4× throughput from width alone, taking
+   MFU 24.3% → 58.7% on unchanged hardware.
+3. **Fuse the elementwise work.** `torch.compile` or a fused attention kernel collapses the
+   softmax / mask / transpose-copy traffic. `aten::copy_` is mostly `.contiguous()` after
+   `.transpose()` — pure memory movement earning no FLOPs.
+4. **Stop instrumenting it.** Worth ~19% of the step on the T4 — and the entire reason this
+   repo exists, so it stays.
+
+**The honest headline: a 4-layer 128-wide fp32 model cannot reach 40% MFU against a
+tensor-core denominator, and no amount of tuning will get it there.** 40% is a number for
+large models in low precision with fused kernels. The useful output of §5 is not the
+percentage — it is knowing *which* of the four terms above owns the gap on the machine in
+front of you, and that answer changed completely between a CPU and a GPU running identical
+code.
 
 ---
 
@@ -1007,7 +1099,8 @@ artifacts/01_shapes.txt        every tensor in a step
 artifacts/02_gradcheck.txt     hand check + step-size sweep + torch gradcheck
 artifacts/03_accumulation.*    the bug, the control, both training curves
 artifacts/04_gradnorm.*        per-step log, the lead example, correlation, symmetry test
-artifacts/05_mfu.*             FLOP accounting, shape census, operator profile, width sweep
+artifacts/05_mfu.*             FLOP accounting, shape census, operator profile, width sweep (CPU run)
+artifacts/05_mfu_t4.png        the same figure from the Tesla T4 run quoted in §5
 artifacts/06_floats.*          bit patterns, ranges, the accumulation failure
 artifacts/results.json         all of it, machine-readable
 ```

@@ -464,9 +464,16 @@ def compute_mfu(dataset, cfg: GPTConfig, batch_size: int = 16, seq_len: int = 12
         print("where the step time actually goes:")
         for k in ("data", "forward", "backward", "gradnorm", "clip", "opt"):
             print(f"  {k:9s} {phases[k]*1e3:7.2f} ms  {phases[k]/dt:6.1%}")
-        if phases.get("barrier_overhead", 0) > 0:
-            print(f"  (phase barriers cost {phases['barrier_overhead']*1e3:.2f} ms on top of "
-                  f"the {dt*1e3:.2f} ms step; shares above are rescaled onto the clean step)")
+        inst = phases.get("instrumented_total")
+        if inst and abs(inst - dt) / dt > 0.02:
+            # Either sign is worth saying out loud. Positive: the barriers cost
+            # real time. Negative: the barriered pass ran FASTER, which is clock
+            # state, not a free lunch. Either way the per-phase milliseconds
+            # below were rescaled to sum to the clean step, so report the factor
+            # rather than let a 20% adjustment happen silently.
+            print(f"  (two passes: clean step {dt*1e3:.2f} ms, barriered sum "
+                  f"{inst*1e3:.2f} ms -> phase ms rescaled x{dt/inst:.2f};")
+            print(f"   the SHARES are the trustworthy part, the absolute ms less so)")
     return res
 
 
