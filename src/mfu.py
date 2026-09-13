@@ -167,6 +167,28 @@ GPU_PEAK = {
 }
 
 
+def cuda_dtypes(major: int) -> list:
+    """Which low-precision GEMMs are worth timing on a CUDA part of this
+    compute capability.
+
+    Picked from the capability, NOT from torch.cuda.is_bf16_supported(): that
+    returns True on Turing because PyTorch counts *emulated* bf16. Timing
+    emulated bf16 on a T4 gives ~2.4 TFLOP/s - slower than its own fp32 - and
+    dividing the achieved throughput by that ceiling produces a flatteringly
+    high MFU with nothing behind it. Turing and Volta have fp16 tensor cores
+    and neither bf16 nor TF32; Ampere and later have both.
+    """
+    return ["tf32", "bf16"] if major >= 8 else ["fp16"]
+
+
+def _real_bf16(dev, props) -> bool:
+    """True only for native bf16. `is_bf16_supported()` says yes to emulation."""
+    try:
+        return bool(torch.cuda.is_bf16_supported(including_emulation=False))
+    except TypeError:                      # older torch: no such keyword
+        return props.major >= 8
+
+
 def _gpu_info(dev) -> dict:
     name = torch.cuda.get_device_name(dev)
     props = torch.cuda.get_device_properties(dev)
@@ -175,7 +197,7 @@ def _gpu_info(dev) -> dict:
         kind="cuda", name=name, sm_count=props.multi_processor_count,
         capability=f"{props.major}.{props.minor}",
         total_mem_gb=props.total_memory / 1e9,
-        bf16_supported=torch.cuda.is_bf16_supported(),
+        bf16_supported=_real_bf16(dev, props),
         theoretical_peak=(spec or {}).get("fp32"),
         peak_tf32=(spec or {}).get("tf32"),
         peak_bf16=(spec or {}).get("bf16"),
@@ -222,8 +244,7 @@ def measured_peak(device=None, sizes=None, reps=8, warmup=3, dtypes=None) -> dic
     if dtypes is None:
         dtypes = ["fp32"]
         if dev.type == "cuda":
-            dtypes += ["tf32"]
-            dtypes += ["bf16"] if torch.cuda.is_bf16_supported() else ["fp16"]
+            dtypes += cuda_dtypes(torch.cuda.get_device_properties(dev).major)
         elif dev.type == "mps":
             dtypes += ["fp16"]
 
@@ -344,13 +365,20 @@ def time_step_phases(dataset, cfg: GPTConfig, batch_size: int, seq_len: int,
 
 
 def compute_mfu(dataset, cfg: GPTConfig, batch_size: int = 16, seq_len: int = 128,
-                reps: int = 20, verbose: bool = True, device=None) -> dict:
+                reps: int = 20, verbose: bool = True, device=None, peak=None) -> dict:
+    """`peak`: a measured_peak() result to reuse instead of measuring again.
+
+    Pass it when computing several MFUs in one session. Re-measuring per call
+    looks harmless and is not: a 70W passively-cooled part throttles as the
+    session heats up, so a ceiling measured later comes out lower and every MFU
+    divided by it is inflated. One ceiling for the whole comparison.
+    """
     dev = device if isinstance(device, torch.device) else pick_device(device)
     fl = flops_per_token(cfg, seq_len)
     step_flops = fl["per_token"] * batch_size * seq_len
     phases = time_step_phases(dataset, cfg, batch_size, seq_len, reps=reps, device=dev)
     info = device_info(dev)
-    peak = measured_peak(dev)
+    peak = peak if peak is not None else measured_peak(dev)
 
     dt = phases["total"]
     achieved = step_flops / dt
@@ -361,8 +389,14 @@ def compute_mfu(dataset, cfg: GPTConfig, batch_size: int = 16, seq_len: int = 12
 
     # What the same run would score if the denominator were the tensor-core peak
     # the "40% MFU" figures are quoted against. Same numerator, honest label.
+    #
+    # Only meaningful if the low-precision GEMM actually came out FASTER than
+    # fp32. If it did not, the dtype is emulated rather than tensor-core backed,
+    # and achieved/that-ceiling is a flattering number with nothing behind it -
+    # so it is reported as None rather than quietly published.
     lowp_ceiling = peak["by_dtype"].get("bf16") or peak["by_dtype"].get("fp16")
-    mfu_lowp = achieved / (lowp_ceiling * 1e9) if lowp_ceiling else None
+    lowp_is_real = bool(lowp_ceiling) and lowp_ceiling > peak["gflops"]
+    mfu_lowp = achieved / (lowp_ceiling * 1e9) if lowp_is_real else None
 
     res = dict(flops=fl, step_flops=step_flops, phases=phases, device=info, peak=peak,
                achieved_flops=achieved, mfu_theoretical=mfu_theory,
@@ -396,10 +430,18 @@ def compute_mfu(dataset, cfg: GPTConfig, batch_size: int = 16, seq_len: int = 12
             print(f"  {tag:<5} {gf/1e3:8.2f} TFLOP/s{frac}")
         print(f"  -> the model trains in fp32, so its ceiling is "
               f"{peak['gflops']/1e3:.2f} TFLOP/s")
-        if lowp_ceiling and lowp_ceiling > 1.5 * peak["gflops"]:
+        if lowp_is_real:
             unit = "tensor cores" if info["kind"] == "cuda" else "low-precision units"
             print(f"  -> leaving {lowp_ceiling/peak['gflops']:.1f}x on the table by not "
                   f"using the {unit} at all")
+        elif lowp_ceiling:
+            # Measured slower than fp32 -> that dtype is emulated here, not
+            # tensor-core backed. Say so, rather than silently dropping the row.
+            print(f"  -> the low-precision GEMM measured SLOWER than fp32 "
+                  f"({lowp_ceiling/1e3:.2f} < {peak['gflops']/1e3:.2f} TFLOP/s), so it is")
+            print(f"     emulated on this part, not tensor-core backed. No tensor-core")
+            print(f"     MFU is reported: dividing by an emulated ceiling would only")
+            print(f"     flatter the result.")
         print()
         print(f"model FLOPs accounting (B={batch_size}, T={seq_len}):")
         print(f"  matmul parameters        : {fl['n_matmul_params']:,}")
@@ -414,7 +456,7 @@ def compute_mfu(dataset, cfg: GPTConfig, batch_size: int = 16, seq_len: int = 12
         if mfu_theory:
             print(f"  MFU vs datasheet fp32 peak   : {mfu_theory:6.2%}")
         print(f"  MFU vs measured fp32 ceiling : {mfu_measured:6.2%}   <- the honest one")
-        if mfu_lowp and lowp_ceiling > 1.5 * peak["gflops"]:
+        if mfu_lowp:
             what = "tensor-core" if info["kind"] == "cuda" else "low-precision"
             print(f"  MFU vs measured {what:<13}: {mfu_lowp:6.2%}   <- the denominator "
                   f"the 40% figures use")
@@ -557,6 +599,10 @@ def size_sweep(dataset, configs=None, reps=5, verbose=True, device=None):
     dev = device if isinstance(device, torch.device) else pick_device(device)
     if configs is None:
         configs = SWEEP_GPU if dev.type == "cuda" else SWEEP_CPU
+    # One ceiling for every point in the sweep. Measuring per point would let
+    # thermal throttling shrink the denominator as the sweep progresses, which
+    # inflates exactly the wide configurations the sweep exists to judge.
+    peak = measured_peak(dev)
     out = []
     for (C, L, B, T) in configs:
         cfg = GPTConfig(vocab_size=dataset.vocab_size, block_size=T,
@@ -564,11 +610,13 @@ def size_sweep(dataset, configs=None, reps=5, verbose=True, device=None):
         torch.manual_seed(0)
         npar = TinyGPT(cfg).num_params()
         r = compute_mfu(dataset, cfg, batch_size=B, seq_len=T, reps=reps, verbose=False,
-                        device=dev)
+                        device=dev, peak=peak)
         out.append(dict(n_embd=C, n_layer=L, batch=B, seq=T, params=npar,
                         ms=r["dt"] * 1e3, gflops=r["achieved_flops"] / 1e9,
                         mfu=r["mfu_measured_ceiling"]))
     if verbose:
+        print(f"all points divided by ONE ceiling measured up front: "
+              f"{peak['gflops']/1e3:.2f} TFLOP/s fp32")
         print(f"{'n_embd':>6} {'layers':>6} {'B':>3} {'T':>4} {'params':>11} "
               f"{'ms/step':>8} {'GFLOP/s':>8} {'MFU':>7}")
         print("-" * 63)
@@ -576,3 +624,21 @@ def size_sweep(dataset, configs=None, reps=5, verbose=True, device=None):
             print(f"{r['n_embd']:>6} {r['n_layer']:>6} {r['batch']:>3} {r['seq']:>4} "
                   f"{r['params']:>11,} {r['ms']:>8.1f} {r['gflops']:>8.1f} {r['mfu']:>7.1%}")
     return out
+
+
+if __name__ == "__main__":
+    # The dtype choice above is the one bug this file has actually shipped:
+    # a T4 was benchmarked in emulated bf16 and scored a flattering 38.7% MFU
+    # against a ceiling slower than its own fp32. Guard the branch.
+    assert cuda_dtypes(7) == ["fp16"], "Volta/Turing: fp16 tensor cores only"
+    assert cuda_dtypes(7) == cuda_dtypes(7.5 // 1), "T4 is sm_75 -> major 7"
+    assert cuda_dtypes(8) == ["tf32", "bf16"], "Ampere gained both"
+    assert cuda_dtypes(9) == ["tf32", "bf16"], "Hopper keeps both"
+    assert "bf16" not in cuda_dtypes(7), "never time emulated bf16 as a ceiling"
+
+    # A ceiling slower than fp32 must never become an MFU denominator.
+    for lowp, fp32, expect in ((2376.0, 6094.0, False),   # the T4 bf16 anomaly
+                               (20000.0, 6094.0, True)):  # a real tensor-core win
+        assert (bool(lowp) and lowp > fp32) is expect, (lowp, fp32)
+
+    print("mfu.py self-check OK")
